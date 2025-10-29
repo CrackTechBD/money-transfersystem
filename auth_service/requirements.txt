@@ -1,0 +1,5 @@
+fastapi==0.112.0
+uvicorn==0.30.3
+pyjwt==2.9.0
+python-dotenv==1.0.1
+pydantic-settings==2.11.0

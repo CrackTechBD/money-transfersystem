@@ -1,0 +1,10 @@
+fastapi==0.112.0
+uvicorn==0.30.3
+SQLAlchemy==2.0.32
+mysqlclient==2.2.4
+alembic==1.13.2
+pydantic==2.8.2
+pydantic-settings==2.11.0
+confluent-kafka==2.5.0
+python-dotenv==1.0.1
+pyjwt==2.9.0

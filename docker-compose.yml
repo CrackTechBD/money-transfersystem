@@ -1,0 +1,212 @@
+# Simplified MySQL Sharding Demo
+# Uses existing single ledger service but adds shard routing logic
+
+services:
+  # Infrastructure services
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    ports:
+      - "9092:9092"
+
+  # MySQL Shards
+  mysql-shard-0:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: paytm_shard
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_shard_0_data:/var/lib/mysql
+      - ./init_shard.sql:/docker-entrypoint-initdb.d/init_shard.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  mysql-shard-1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: paytm_shard
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_shard_1_data:/var/lib/mysql
+      - ./init_shard.sql:/docker-entrypoint-initdb.d/init_shard.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  mysql-shard-2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: paytm_shard
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_shard_2_data:/var/lib/mysql
+      - ./init_shard.sql:/docker-entrypoint-initdb.d/init_shard.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  mysql-shard-3:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: paytm_shard
+    ports:
+      - "3309:3306"
+    volumes:
+      - mysql_shard_3_data:/var/lib/mysql
+      - ./init_shard.sql:/docker-entrypoint-initdb.d/init_shard.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # Other infrastructure
+  cassandra:
+    image: cassandra:4.1
+    ports:
+      - "9042:9042"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+    environment:
+      - CASSANDRA_SEEDS=cassandra
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      - ./cassandra/cql-init.cql:/docker-entrypoint-initdb.d/cql-init.cql
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Application services (existing ones, but connect to shard 0 for demo)
+  auth_service:
+    build:
+      context: .
+      dockerfile: auth_service/Dockerfile
+    ports:
+      - "8001:8000"
+
+  fraud_service:
+    build:
+      context: .
+      dockerfile: fraud_service/Dockerfile
+    ports:
+      - "8003:8000"
+    depends_on:
+      - cassandra
+      - kafka
+      - shard_manager_service
+
+  notification_service:
+    build:
+      context: .
+      dockerfile: notification_service/Dockerfile
+    ports:
+      - "8004:8000"
+    depends_on:
+      - kafka
+
+  analytics_service:
+    build:
+      context: .
+      dockerfile: analytics_service/Dockerfile
+    ports:
+      - "8005:8000"
+    depends_on:
+      - cassandra
+      - kafka
+
+  # Shard Manager Service (new)
+  shard_manager_service:
+    build:
+      context: .
+      dockerfile: shard_manager_service/Dockerfile
+    ports:
+      - "8006:8000"
+    depends_on:
+      mysql-shard-0:
+        condition: service_healthy
+      mysql-shard-1:
+        condition: service_healthy
+      mysql-shard-2:
+        condition: service_healthy
+      mysql-shard-3:
+        condition: service_healthy
+    environment:
+      - TOTAL_SHARDS=4
+      - SHARD_0_HOST=mysql-shard-0
+      - SHARD_1_HOST=mysql-shard-1
+      - SHARD_2_HOST=mysql-shard-2
+      - SHARD_3_HOST=mysql-shard-3
+      - SHARD_0_PASSWORD=rootpassword
+      - SHARD_1_PASSWORD=rootpassword
+      - SHARD_2_PASSWORD=rootpassword
+      - SHARD_3_PASSWORD=rootpassword
+      - SHARD_0_DB=paytm_shard
+      - SHARD_1_DB=paytm_shard
+      - SHARD_2_DB=paytm_shard
+      - SHARD_3_DB=paytm_shard
+
+  # Fraud Action Service (new)
+  fraud_action_service:
+    build:
+      context: .
+      dockerfile: fraud_action_service/Dockerfile
+    ports:
+      - "8007:8007"
+    depends_on:
+      - cassandra
+      - kafka
+      - shard_manager_service
+    environment:
+      - CASSANDRA_HOST=cassandra
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+
+  # Fraud Admin Dashboard (new)
+  fraud_admin_dashboard:
+    build:
+      context: .
+      dockerfile: fraud_admin_dashboard/Dockerfile
+    ports:
+      - "8008:8008"
+    depends_on:
+      - fraud_action_service
+volumes:
+  mysql_shard_0_data:
+  mysql_shard_1_data:
+  mysql_shard_2_data:
+  mysql_shard_3_data:
+  cassandra_data:
