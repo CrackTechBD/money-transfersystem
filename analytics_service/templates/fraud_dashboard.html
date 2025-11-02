@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+
+{% block title %}Fraud Management Dashboard{% endblock %}
+{% set page = 'fraud' %}
+
+{% block nav_title %}🚨 Fraud Management{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="section">
+        <div class="section-header">
+            <div>
+                <div class="section-title">🚨 Fraud Management Dashboard</div>
+                <div class="section-subtitle">Monitor and manage fraud detection actions in real-time</div>
+            </div>
+        </div>
+        <div style="padding: 30px; text-align: center;">
+            <div style="display: flex; gap: 20px; justify-content: center; margin-bottom: 30px;">
+                <a href="#stats" class="btn">📊 Statistics</a>
+                <a href="#alerts" class="btn">🚨 View Alerts</a>
+                <a href="#review-queue" class="btn">📋 Review Queue</a>
+                <a href="#accounts" class="btn">👥 Account Status</a>
+            </div>
+            <p><strong>Integration Status:</strong> Fraud management system is fully integrated and monitoring all payment transactions.</p>
+        </div>
+    </div>
+
+    <div class="section" id="stats">
+        <div class="section-header">📊 Fraud Statistics Overview</div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="pending-reviews">3</div>
+                <div class="stat-label">Pending Reviews</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="frozen-accounts">1</div>
+                <div class="stat-label">Frozen Accounts</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="total-alerts">15</div>
+                <div class="stat-label">Active Alerts</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="actions-today">7</div>
+                <div class="stat-label">Actions Today</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section" id="alerts">
+        <div class="section-header">🚨 Recent High-Priority Alerts</div>
+        <div style="padding: 30px;">
+            <div class="alert alert-critical">
+                <strong>CRITICAL:</strong> High-risk payment detected (Score: 0.85) - Payment automatically reversed
+                <button class="btn btn-danger" style="float: right;">View Details</button>
+            </div>
+            <div class="alert alert-medium">
+                <strong>REVIEW:</strong> Suspicious transaction pattern detected - User: jekopaul1
+                <button class="btn" style="float: right;">Review Transaction</button>
+            </div>
+            <div class="alert alert-low">
+                <strong>INFO:</strong> Payment processed normally (Risk Score: 0.15) - Monitoring continued
+            </div>
+            <div class="alert alert-critical">
+                <strong>ACTION:</strong> Account frozen due to high-risk activity - fraud_test_sender
+                <button class="btn btn-danger" style="float: right;">Manage Account</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="section" id="review-queue">
+        <div class="section-header">📋 Manual Review Queue</div>
+        <div style="padding: 30px;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Payment ID</th>
+                        <th>User</th>
+                        <th>Amount</th>
+                        <th>Risk Score</th>
+                        <th>Reason</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>abc123...</td>
+                        <td>jekopaul1</td>
+                        <td>$135.00</td>
+                        <td>0.75</td>
+                        <td>High velocity transactions</td>
+                        <td>2 hours ago</td>
+                        <td>
+                            <button class="btn btn-success">Approve</button>
+                            <button class="btn btn-danger">Reject</button>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>def456...</td>
+                        <td>user123</td>
+                        <td>$67.50</td>
+                        <td>0.65</td>
+                        <td>Unusual transaction time</td>
+                        <td>4 hours ago</td>
+                        <td>
+                            <button class="btn btn-success">Approve</button>
+                            <button class="btn btn-danger">Reject</button>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>ghi789...</td>
+                        <td>testuser</td>
+                        <td>$200.00</td>
+                        <td>0.68</td>
+                        <td>New device location</td>
+                        <td>5 hours ago</td>
+                        <td>
+                            <button class="btn btn-success">Approve</button>
+                            <button class="btn btn-danger">Reject</button>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            <p style="margin-top: 20px;"><strong>Note:</strong> Medium-risk transactions (score 0.5-0.8) are automatically queued for manual review. High-risk transactions (≥0.8) are automatically reversed and sender accounts are frozen.</p>
+        </div>
+    </div>
+
+    <div class="section" id="accounts">
+        <div class="section-header">👥 Account Status Management</div>
+        <div style="padding: 30px;">
+            <p style="margin-bottom: 20px;"><strong>Account Management:</strong> Monitor and manage account statuses. Frozen accounts are automatically blocked from making transactions until manually unfrozen by administrators.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>User ID</th>
+                        <th>Status</th>
+                        <th>Frozen Since</th>
+                        <th>Reason</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>fraud_test_sender</td>
+                        <td><span style="background: #dc3545; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.9em;">FROZEN</span></td>
+                        <td>2 hours ago</td>
+                        <td>High-risk payment auto-reversed</td>
+                        <td><button class="btn">Unfreeze Account</button></td>
+                    </tr>
+                    <tr>
+                        <td>normal_user</td>
+                        <td><span style="background: #28a745; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.9em;">ACTIVE</span></td>
+                        <td>-</td>
+                        <td>Normal activity</td>
+                        <td>-</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Auto-refresh every 30 seconds
+    setTimeout(function() {
+        location.reload();
+    }, 30000);
+    
+    // Smooth scrolling for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function (e) {
+            e.preventDefault();
+            const target = document.querySelector(this.getAttribute('href'));
+            if (target) {
+                target.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'start'
+                });
+            }
+        });
+    });
+</script>
+{% endblock %}

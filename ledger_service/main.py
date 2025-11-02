@@ -83,6 +83,122 @@ async def commit(payment: InitiatePayment):
 
     return {"status": "committed"}
 
+@app.post("/payment/transfer")
+async def transfer_money(payment_data: dict):
+    """Simple transfer endpoint for user-to-user payments with sharding support"""
+    import hashlib
+    import mysql.connector
+    import uuid
+    from datetime import datetime
+    
+    try:
+        from_user = payment_data.get("from_user_id")
+        to_user = payment_data.get("to_user_id")
+        amount = float(payment_data.get("amount", 0))
+        
+        if not from_user or not to_user or amount <= 0:
+            raise HTTPException(400, "Invalid payment data")
+        
+        # Convert to cents
+        amount_cents = int(amount * 100)
+        payment_id = str(uuid.uuid4())
+        
+        # Calculate shards for both users
+        from_shard = int(hashlib.md5(from_user.encode()).hexdigest(), 16) % 4
+        to_shard = int(hashlib.md5(to_user.encode()).hexdigest(), 16) % 4
+        
+        print(f"💳 Transfer: {from_user}(shard {from_shard}) -> {to_user}(shard {to_shard}), ${amount}")
+        
+        # Get shard connections
+        def get_shard_conn(shard_id):
+            import os
+            host = os.environ.get(f'SHARD_{shard_id}_HOST', f'mysql-shard-{shard_id}')
+            return mysql.connector.connect(
+                host=host, port=3306, user='root',
+                password='rootpassword', database='paytm_shard'
+            )
+        
+        # Connect to shards
+        from_conn = get_shard_conn(from_shard)
+        to_conn = get_shard_conn(to_shard) if to_shard != from_shard else from_conn
+        
+        try:
+            # Start transactions
+            from_cursor = from_conn.cursor(dictionary=True)
+            to_cursor = to_conn.cursor(dictionary=True) if to_conn != from_conn else from_cursor
+            
+            # Check sender balance
+            from_cursor.execute("SELECT balance FROM accounts WHERE user_id = %s FOR UPDATE", (from_user,))
+            from_account = from_cursor.fetchone()
+            
+            if not from_account:
+                raise HTTPException(400, f"Sender account not found: {from_user}")
+            
+            if from_account['balance'] < amount_cents:
+                raise HTTPException(400, f"Insufficient balance: have ${from_account['balance']/100:.2f}, need ${amount:.2f}")
+            
+            # Check recipient exists
+            to_cursor.execute("SELECT balance FROM accounts WHERE user_id = %s FOR UPDATE", (to_user,))
+            to_account = to_cursor.fetchone()
+            
+            if not to_account:
+                raise HTTPException(400, f"Recipient account not found: {to_user}")
+            
+            # Debit sender
+            from_cursor.execute(
+                "UPDATE accounts SET balance = balance - %s WHERE user_id = %s",
+                (amount_cents, from_user)
+            )
+            from_cursor.execute(
+                "INSERT INTO ledger_entries (payment_id, account_id, amount, direction, created_at) VALUES (%s, %s, %s, 'debit', NOW())",
+                (payment_id, from_user, amount_cents)
+            )
+            
+            # Credit recipient
+            to_cursor.execute(
+                "UPDATE accounts SET balance = balance + %s WHERE user_id = %s",
+                (amount_cents, to_user)
+            )
+            to_cursor.execute(
+                "INSERT INTO ledger_entries (payment_id, account_id, amount, direction, created_at) VALUES (%s, %s, %s, 'credit', NOW())",
+                (payment_id, to_user, amount_cents)
+            )
+            
+            # Commit both transactions
+            from_conn.commit()
+            if to_conn != from_conn:
+                to_conn.commit()
+            
+            print(f"✅ Transfer complete: {payment_id[:16]}...")
+            
+            return {
+                "status": "success",
+                "payment_id": payment_id,
+                "from_user": from_user,
+                "to_user": to_user,
+                "amount": amount,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            from_conn.rollback()
+            if to_conn != from_conn:
+                to_conn.rollback()
+            raise
+        finally:
+            from_cursor.close()
+            if to_conn != from_conn:
+                to_cursor.close()
+            from_conn.close()
+            if to_conn != from_conn:
+                to_conn.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Transfer failed: {e}")
+        raise HTTPException(500, f"Transfer failed: {str(e)}")
+
 @app.get("/health")
 async def health():
     return {"ok": True, "service": "ledger"}

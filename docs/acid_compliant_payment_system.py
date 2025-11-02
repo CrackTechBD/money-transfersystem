@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from sqlalchemy import text
+
 class TransactionPhase(Enum):
     PREPARING = "PREPARING"
     PREPARED = "PREPARED"

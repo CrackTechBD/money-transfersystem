@@ -46,8 +46,48 @@ paytm-style/
 - **Ledger Service**: ACID transactions with MySQL sharding
 - **Fraud Service**: Real-time transaction monitoring 
 - **Notification Service**: Event-driven notifications
-- **Analytics Service**: Real-time data aggregation
+- **Analytics Service**: Real-time data aggregation with admin and user dashboards
 - **Shard Manager**: MySQL shard routing and management
+
+## Quick Start
+
+### 1. Start all services
+```bash
+docker-compose up -d
+```
+
+### 2. Access the dashboards
+- **Admin Dashboard**: http://localhost:8005/dashboard
+  - Login: `admin` / `paytm123` (or `analyst` / `analytics123`, `viewer` / `viewer123`)
+  - View system analytics, shard performance, transactions
+  
+- **User Wallet**: http://localhost:8005/user/login
+  - Login with any valid user_id (no password required for demo)
+  - Check balance, send money, view transaction history
+
+### 3. Create test users
+```bash
+# Using the quick script
+./create_user_quick.sh john_doe 500
+
+# Or manually with Docker
+docker exec paytm-style-analytics_service-1 python3 -c "
+import hashlib, uuid, mysql.connector
+user_id, balance = 'jane_doe', 1000.00
+shard = int(hashlib.md5(user_id.encode()).hexdigest(), 16) % 4
+conn = mysql.connector.connect(host=f'mysql-shard-{shard}', user='root', password='rootpassword', database='paytm_shard')
+c = conn.cursor()
+c.execute('INSERT INTO accounts (id, user_id, balance, currency) VALUES (%s, %s, %s, \"USD\")', (str(uuid.uuid4()), user_id, int(balance*100)))
+conn.commit()
+print(f'Created {user_id} with \${balance}')
+"
+```
+
+### Pre-created test users
+- `jekopaul2` - $1,136 balance
+- `bob_jones` - $750 balance  
+- `sarah_smith` - $1,200 balance
+- `alice` - $500 balance
 
 ### MySQL Sharding Infrastructure
 - **4-Shard MySQL Cluster**: Horizontal scaling across databases

@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+
+{% block title %}Shard {{ shard_id }} - Detailed Analytics{% endblock %}
+
+{% block extra_styles %}
+<style>
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        padding: 30px;
+    }
+    .stat-card {
+        background: white;
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        border-left: 5px solid #667eea;
+    }
+    .stat-value {
+        font-size: 2em;
+        font-weight: bold;
+        color: #2a5298;
+        margin-bottom: 8px;
+    }
+    .stat-label {
+        color: #666;
+        font-size: 0.9em;
+    }
+    .performance-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 20px;
+        padding: 0 30px 30px 30px;
+    }
+    .performance-card {
+        background: #f8f9fa;
+        border-radius: 12px;
+        padding: 20px;
+        border: 2px solid #e9ecef;
+    }
+    .performance-header {
+        font-size: 1.2em;
+        font-weight: bold;
+        color: #2a5298;
+        margin-bottom: 15px;
+    }
+    .performance-item {
+        display: flex;
+        justify-content: space-between;
+        margin: 10px 0;
+        padding: 8px 0;
+        border-bottom: 1px solid #dee2e6;
+    }
+    .performance-item:last-child {
+        border-bottom: none;
+    }
+    .status-indicator {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 8px;
+    }
+    .healthy { background: #28a745; }
+    .warning { background: #ffc107; }
+    .error { background: #dc3545; }
+    .back-link {
+        display: inline-block;
+        margin-bottom: 20px;
+        color: #667eea;
+        text-decoration: none;
+        font-weight: 600;
+    }
+    .back-link:hover {
+        text-decoration: underline;
+    }
+    .update-info {
+        text-align: center;
+        padding: 20px;
+        color: #666;
+        font-style: italic;
+        background: rgba(255, 255, 255, 0.5);
+        margin-top: 20px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <a href="/dashboard/html" class="back-link">← Back to Dashboard</a>
+    
+    <div class="section">
+        <div class="section-header">
+            <div>
+                <div class="section-title">🗄️ Shard {{ shard_id }} Analytics</div>
+                <div class="section-subtitle">Detailed performance metrics and health status</div>
+            </div>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">
+                    <span class="status-indicator {% if details.status == 'healthy' %}healthy{% else %}error{% endif %}"></span>
+                    {{ details.status|title }}
+                </div>
+                <div class="stat-label">Status</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ "{:,}".format(details.accounts) }}</div>
+                <div class="stat-label">Total Accounts</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">${{ "{:,.2f}".format(details.total_balance) }}</div>
+                <div class="stat-label">Total Balance</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ details.connection|title }}</div>
+                <div class="stat-label">Connection</div>
+            </div>
+        </div>
+        
+        <div class="performance-grid">
+            <div class="performance-card">
+                <div class="performance-header">💻 System Resources</div>
+                <div class="performance-item">
+                    <span>CPU Usage:</span>
+                    <span style="color: {% if performance.cpu_usage > 80 %}#dc3545{% elif performance.cpu_usage < 50 %}#28a745{% else %}#ffc107{% endif %};">
+                        {{ performance.cpu_usage }}%
+                    </span>
+                </div>
+                <div class="performance-item">
+                    <span>Memory Usage:</span>
+                    <span style="color: {% if performance.memory_usage > 80 %}#dc3545{% elif performance.memory_usage < 50 %}#28a745{% else %}#ffc107{% endif %};">
+                        {{ performance.memory_usage }}%
+                    </span>
+                </div>
+                <div class="performance-item">
+                    <span>Disk Usage:</span>
+                    <span style="color: {% if performance.disk_usage > 80 %}#dc3545{% elif performance.disk_usage < 50 %}#28a745{% else %}#ffc107{% endif %};">
+                        {{ performance.disk_usage }}%
+                    </span>
+                </div>
+            </div>
+            
+            <div class="performance-card">
+                <div class="performance-header">⚡ Query Performance</div>
+                <div class="performance-item">
+                    <span>Queries/Second:</span>
+                    <span style="color: #2a5298; font-weight: bold;">{{ "{:,}".format(performance.queries_per_second) }}</span>
+                </div>
+                <div class="performance-item">
+                    <span>Avg Query Time:</span>
+                    <span style="color: {% if performance.avg_query_time > 10 %}#dc3545{% elif performance.avg_query_time < 5 %}#28a745{% else %}#ffc107{% endif %};">
+                        {{ performance.avg_query_time }}ms
+                    </span>
+                </div>
+                <div class="performance-item">
+                    <span>Last Backup:</span>
+                    <span>{{ last_backup_time }}</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="update-info">
+            Last updated: {{ now.strftime("%Y-%m-%d %H:%M:%S") }} | Auto-refresh: 60 seconds
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Auto-refresh every 60 seconds
+    setTimeout(function() {
+        location.reload();
+    }, 60000);
+</script>
+{% endblock %}

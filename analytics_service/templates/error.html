@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Error{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="section">
+        <div class="section-header" style="background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);">
+            <div>
+                <div class="section-title">⚠️ Error</div>
+                <div class="section-subtitle">Something went wrong</div>
+            </div>
+        </div>
+        
+        <div style="padding: 40px; text-align: center;">
+            <div style="background: #f8d7da; color: #721c24; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 5px solid #dc3545;">
+                <h2 style="margin: 0 0 10px 0;">{{ error }}</h2>
+            </div>
+            
+            <a href="/dashboard/html" style="display: inline-block; background: #667eea; color: white; padding: 12px 30px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 20px;">
+                ← Back to Dashboard
+            </a>
+        </div>
+    </div>
+</div>
+{% endblock %}

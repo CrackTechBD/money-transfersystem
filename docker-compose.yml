@@ -180,30 +180,6 @@ services:
       - SHARD_2_DB=paytm_shard
       - SHARD_3_DB=paytm_shard
 
-  # Fraud Action Service (new)
-  fraud_action_service:
-    build:
-      context: .
-      dockerfile: fraud_action_service/Dockerfile
-    ports:
-      - "8007:8007"
-    depends_on:
-      - cassandra
-      - kafka
-      - shard_manager_service
-    environment:
-      - CASSANDRA_HOST=cassandra
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-
-  # Fraud Admin Dashboard (new)
-  fraud_admin_dashboard:
-    build:
-      context: .
-      dockerfile: fraud_admin_dashboard/Dockerfile
-    ports:
-      - "8008:8008"
-    depends_on:
-      - fraud_action_service
 volumes:
   mysql_shard_0_data:
   mysql_shard_1_data:

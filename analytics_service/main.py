@@ -1,32 +1,75 @@
-import json, requests
-from fastapi import FastAPI, Query, HTTPException, Depends, Header
-from fastapi.responses import HTMLResponse
+import json, requests, hashlib
+from fastapi import FastAPI, Query, HTTPException, Depends, Header, Request, Form, Cookie
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from common.settings import settings
-from common.security import verify_token
+from common.security import verify_token, mint_internal_jwt
 import mysql.connector
 from mysql.connector import Error
-import hashlib
+import jwt
+import os
 
-app = FastAPI(title="Enhanced Analytics Service", version="2.0.0")
+app = FastAPI(title="Secured Analytics Service", version="3.0.0")
 
-# Authentication dependency
-async def get_current_user(authorization: str = Header(..., description="Bearer token")):
-    """Extract and validate JWT token from Authorization header"""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401, 
-            detail="Missing or invalid authorization header. Expected: Bearer <token>"
-        )
-    
-    token = authorization.split(" ", 1)[1]
+# Template setup
+templates = Jinja2Templates(directory="templates")
+
+# Demo users for authentication
+DEMO_USERS = {
+    "admin": {"password": "paytm123", "role": "admin", "name": "Administrator"},
+    "analyst": {"password": "analytics123", "role": "analyst", "name": "Data Analyst"},
+    "viewer": {"password": "viewer123", "role": "viewer", "name": "Read Only User"}
+}
+
+# JWT Secret for session management
+JWT_SECRET = settings.jwt_secret if hasattr(settings, 'jwt_secret') else "analytics-demo-secret-key"
+JWT_ALGORITHM = "HS256"
+
+def create_access_token(username: str, role: str = "user") -> str:
+    """Create JWT token for user session"""
+    payload = {
+        "sub": username,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=8),  # 8 hour expiry
+        "iat": datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_session_token(token: str) -> dict:
+    """Verify JWT session token"""
     try:
-        return verify_token(token)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if username and username in DEMO_USERS:
+            return {
+                "username": username,
+                "role": payload.get("role", "user"),
+                "name": DEMO_USERS[username]["name"]
+            }
+        return None
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.JWTError:
+        return None
+
+async def get_current_user(request: Request) -> Optional[dict]:
+    """Get current authenticated user from session"""
+    token = request.cookies.get("session_token")
+    if not token:
+        return None
+    return verify_session_token(token)
+
+async def require_auth(request: Request) -> dict:
+    """Require authentication for protected endpoints"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
 
 def get_shard_id(user_id: str) -> int:
     """Determine which shard contains this user (same logic as shard manager)"""
@@ -362,6 +405,60 @@ def get_shard_analytics():
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+# Authentication Routes
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, error: str = Query(None), success: str = Query(None)):
+    """Display login page"""
+    # If already logged in, redirect to dashboard
+    user = await get_current_user(request)
+    if user:
+        return RedirectResponse(url="/dashboard/html", status_code=302)
+    
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "error": error,
+        "success": success
+    })
+
+@app.post("/login")
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    """Handle login form submission"""
+    if username in DEMO_USERS and DEMO_USERS[username]["password"] == password:
+        # Create session token
+        token = create_access_token(username, DEMO_USERS[username]["role"])
+        
+        # Create response and set cookie
+        response = RedirectResponse(url="/dashboard/html", status_code=302)
+        response.set_cookie(
+            key="session_token",
+            value=token,
+            max_age=8 * 60 * 60,  # 8 hours
+            httponly=True,
+            secure=False,  # Set to True in production with HTTPS
+            samesite="lax"
+        )
+        return response
+    else:
+        # Redirect back to login with error
+        return RedirectResponse(url="/login?error=Invalid username or password", status_code=302)
+
+@app.get("/logout")
+async def logout():
+    """Handle logout"""
+    response = RedirectResponse(url="/login?success=Logged out successfully", status_code=302)
+    response.delete_cookie(key="session_token")
+    return response
+
+# Protected Dashboard Routes
+@app.get("/", response_class=HTMLResponse)
+async def root(request: Request):
+    """Redirect root to login or dashboard"""
+    user = await get_current_user(request)
+    if user:
+        return RedirectResponse(url="/dashboard/html")
+    else:
+        return RedirectResponse(url="/login")
 
 @app.get("/dashboard")
 async def get_dashboard_data():
@@ -874,923 +971,90 @@ async def get_shard_details(shard_id: str):
     }
 
 @app.get("/dashboard/html", response_class=HTMLResponse)
-async def get_dashboard_html():
-    """Get enhanced HTML dashboard with transaction and shard analytics"""
+async def get_dashboard_html(request: Request, current_user: dict = Depends(require_auth)):
+    """Get enhanced HTML dashboard with transaction and shard analytics - requires authentication"""
     data = await get_dashboard_data()
     
     if "error" in data:
-        return f"<html><body><h1>Error</h1><p>{data['error']}</p></body></html>"
+        return templates.TemplateResponse("error.html", {
+            "request": request,
+            "error": data["error"]
+        })
     
-    system_overview = data.get("system_overview", {})
-    transaction_overview = data.get("transaction_overview", {})
-    shard_details = data.get("shard_details", {})
-    recent_transactions = data.get("recent_transactions", [])
-    
-    # Build transaction rows HTML
-    transaction_rows_html = ""
-    for txn in recent_transactions[:8]:  # Show last 8 transactions
-        status_color = "#28a745" if txn["status"] == "success" else "#dc3545"
-        status_icon = "✅" if txn["status"] == "success" else "❌"
-        
-        transaction_rows_html += f"""
-                <tr>
-                    <td>{txn["transaction_id"]}</td>
-                    <td>{datetime.fromisoformat(txn["timestamp"]).strftime("%H:%M:%S")}</td>
-                    <td>${txn["amount"]:.2f}</td>
-                    <td><span style="color: {status_color};">{status_icon} {txn["status"].title()}</span></td>
-                    <td>{txn["user_id"]}</td>
-                    <td>{txn["payment_method"].title()}</td>
-                </tr>"""
-    
-    # Build shard cards HTML
-    shard_cards_html = ""
-    for shard_id, shard_info in shard_details.items():
-        status_color = "#28a745" if shard_info.get('status') == 'healthy' else "#dc3545"
-        shard_cards_html += f"""
-                <div class="shard-card" onclick="window.open('/shard/{shard_id}/html', '_blank')">
-                    <div class="shard-header">
-                        <span class="shard-status" style="background: {status_color};"></span>
-                        Shard {shard_id}
-                        <span class="view-details">View Details →</span>
-                    </div>
-                    <div class="shard-detail">
-                        <span>Status:</span>
-                        <span style="color: {status_color}; font-weight: bold;">{shard_info.get('status', 'unknown').title()}</span>
-                    </div>
-                    <div class="shard-detail">
-                        <span>Accounts:</span>
-                        <span>{shard_info.get('accounts', 0):,}</span>
-                    </div>
-                    <div class="shard-detail">
-                        <span>Total Balance:</span>
-                        <span>${shard_info.get('total_balance', 0):,.2f}</span>
-                    </div>
-                    <div class="shard-detail">
-                        <span>Connection:</span>
-                        <span style="color: {status_color};">{shard_info.get('connection', 'unknown')}</span>
-                    </div>
-                </div>"""
-
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>PayTM-Style Analytics Dashboard</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * {{
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }}
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: #333;
-                min-height: 100vh;
-            }}
-            .nav-bar {{
-                background: rgba(255, 255, 255, 0.95);
-                backdrop-filter: blur(10px);
-                padding: 15px 30px;
-                box-shadow: 0 2px 20px rgba(0,0,0,0.1);
-                position: sticky;
-                top: 0;
-                z-index: 100;
-            }}
-            .nav-content {{
-                max-width: 1400px;
-                margin: 0 auto;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-            .nav-title {{
-                font-size: 1.8em;
-                font-weight: bold;
-                color: #2a5298;
-            }}
-            .nav-links {{
-                display: flex;
-                gap: 20px;
-            }}
-            .nav-link {{
-                color: #666;
-                text-decoration: none;
-                padding: 8px 16px;
-                border-radius: 6px;
-                transition: all 0.3s ease;
-            }}
-            .nav-link:hover, .nav-link.active {{
-                background: #667eea;
-                color: white;
-            }}
-            .container {{
-                max-width: 1400px;
-                margin: 20px auto;
-                padding: 0 20px;
-            }}
-            .section {{
-                background: rgba(255, 255, 255, 0.95);
-                border-radius: 15px;
-                margin-bottom: 20px;
-                overflow: hidden;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-            }}
-            .section-header {{
-                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-                color: white;
-                padding: 20px 30px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-            .section-title {{
-                font-size: 1.5em;
-                font-weight: 600;
-            }}
-            .section-subtitle {{
-                opacity: 0.9;
-                font-size: 0.9em;
-            }}
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                padding: 30px;
-            }}
-            .stat-card {{
-                background: white;
-                border-radius: 12px;
-                padding: 25px;
-                text-align: center;
-                border-left: 5px solid #667eea;
-                transition: all 0.3s ease;
-                cursor: pointer;
-            }}
-            .stat-card:hover {{
-                transform: translateY(-5px);
-                box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-            }}
-            .stat-value {{
-                font-size: 2.2em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 8px;
-            }}
-            .stat-label {{
-                color: #666;
-                font-size: 1em;
-                margin-bottom: 5px;
-            }}
-            .stat-change {{
-                font-size: 0.8em;
-                color: #28a745;
-                font-weight: 500;
-            }}
-            .transaction-grid {{
-                display: grid;
-                grid-template-columns: 2fr 1fr;
-                gap: 30px;
-                padding: 30px;
-            }}
-            .transaction-table {{
-                background: white;
-                border-radius: 12px;
-                overflow: hidden;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            }}
-            .table-header {{
-                background: #f8f9fa;
-                padding: 15px 20px;
-                border-bottom: 2px solid #e9ecef;
-                font-weight: bold;
-                color: #2a5298;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-            .view-all-btn {{
-                background: #667eea;
-                color: white;
-                padding: 6px 12px;
-                border-radius: 6px;
-                text-decoration: none;
-                font-size: 0.9em;
-                transition: all 0.3s ease;
-            }}
-            .view-all-btn:hover {{
-                background: #5a6fd8;
-                transform: translateY(-2px);
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-            }}
-            th, td {{
-                padding: 12px 15px;
-                text-align: left;
-                border-bottom: 1px solid #e9ecef;
-            }}
-            th {{
-                background: #f8f9fa;
-                font-weight: 600;
-                color: #495057;
-                font-size: 0.9em;
-            }}
-            td {{
-                font-size: 0.9em;
-            }}
-            tr:hover {{
-                background: #f8f9fa;
-            }}
-            .metrics-panel {{
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            }}
-            .metric-item {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 12px 0;
-                border-bottom: 1px solid #e9ecef;
-            }}
-            .metric-item:last-child {{
-                border-bottom: none;
-            }}
-            .metric-label {{
-                color: #666;
-                font-size: 0.9em;
-            }}
-            .metric-value {{
-                font-weight: bold;
-                color: #2a5298;
-            }}
-            .shard-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                gap: 20px;
-                padding: 30px;
-            }}
-            .shard-card {{
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                border: 2px solid #e9ecef;
-                transition: all 0.3s ease;
-                cursor: pointer;
-                position: relative;
-            }}
-            .shard-card:hover {{
-                border-color: #667eea;
-                transform: translateY(-3px);
-                box-shadow: 0 8px 25px rgba(0,0,0,0.15);
-            }}
-            .shard-header {{
-                font-size: 1.3em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 15px;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 10px;
-            }}
-            .shard-status {{
-                display: inline-block;
-                width: 12px;
-                height: 12px;
-                border-radius: 50%;
-                background: #28a745;
-            }}
-            .view-details {{
-                font-size: 0.8em;
-                color: #667eea;
-                opacity: 0;
-                transition: opacity 0.3s ease;
-            }}
-            .shard-card:hover .view-details {{
-                opacity: 1;
-            }}
-            .shard-detail {{
-                display: flex;
-                justify-content: space-between;
-                margin: 8px 0;
-                padding: 8px 0;
-                border-bottom: 1px solid #f0f0f0;
-                font-size: 0.9em;
-            }}
-            .shard-detail:last-child {{
-                border-bottom: none;
-            }}
-            .system-status {{
-                background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
-                color: white;
-                padding: 15px 30px;
-                margin: 20px 30px;
-                border-radius: 10px;
-                text-align: center;
-                font-weight: bold;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                gap: 20px;
-            }}
-            .status-item {{
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }}
-            .refresh-time {{
-                text-align: center;
-                padding: 20px;
-                color: #666;
-                font-style: italic;
-                background: rgba(255, 255, 255, 0.5);
-            }}
-            @keyframes pulse {{
-                0% {{ opacity: 1; }}
-                50% {{ opacity: 0.7; }}
-                100% {{ opacity: 1; }}
-            }}
-            .live-indicator {{
-                display: inline-block;
-                width: 8px;
-                height: 8px;
-                background: #28a745;
-                border-radius: 50%;
-                animation: pulse 2s infinite;
-                margin-left: 8px;
-            }}
-        </style>
-        <script>
-            // Auto-refresh every 30 seconds
-            setTimeout(function() {{
-                location.reload();
-            }}, 30000);
-            
-            // Add click handlers
-            function openTransactions() {{
-                window.open('/transactions', '_blank');
-            }}
-            
-            function openShard(shardId) {{
-                window.open('/shard/' + shardId, '_blank');
-            }}
-        </script>
-    </head>
-    <body>
-        <nav class="nav-bar">
-            <div class="nav-content">
-                <div class="nav-title">� PayTM-Style Analytics</div>
-                <div class="nav-links">
-                    <a href="#" class="nav-link active">Dashboard</a>
-                    <a href="/transactions/html" class="nav-link" target="_blank">Transactions</a>
-                    <a href="/dashboard" class="nav-link" target="_blank">API</a>
-                </div>
-            </div>
-        </nav>
-
-        <div class="container">
-            <!-- System Status -->
-            <div class="system-status">
-                <div class="status-item">
-                    🟢 System: {system_overview.get('system_health', 'Unknown').upper()}
-                </div>
-                <div class="status-item">
-                    📊 Shards: {system_overview.get('shard_count', 0)} Active
-                </div>
-                <div class="status-item">
-                    ⚡ Success Rate: {transaction_overview.get('success_rate', 0)}%
-                </div>
-                <div class="status-item">
-                    🕒 Live Data<span class="live-indicator"></span>
-                </div>
-            </div>
-
-            <!-- Account & Balance Overview -->
-            <div class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="section-title">💰 Account & Balance Overview</div>
-                        <div class="section-subtitle">Real-time account statistics across all shards</div>
-                    </div>
-                </div>
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-value">{system_overview.get('total_accounts', 0):,}</div>
-                        <div class="stat-label">Total Accounts</div>
-                        <div class="stat-change">+{max(1, system_overview.get('total_accounts', 0) // 20)} today</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${system_overview.get('total_balance', 0):,.0f}</div>
-                        <div class="stat-label">Total Balance</div>
-                        <div class="stat-change">+{max(100, int(float(system_overview.get('total_balance', 0)) * 0.05))} today</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${system_overview.get('average_balance', 0):,.0f}</div>
-                        <div class="stat-label">Average Balance</div>
-                        <div class="stat-change">+{max(5, int(float(system_overview.get('average_balance', 0)) * 0.1))} vs yesterday</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">{system_overview.get('shard_count', 0)}</div>
-                        <div class="stat-label">Active Shards</div>
-                        <div class="stat-change">All healthy</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Transaction Overview -->
-            <div class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="section-title">💳 Transaction Analytics</div>
-                        <div class="section-subtitle">Real-time payment processing statistics</div>
-                    </div>
-                </div>
-                <div class="stats-grid">
-                    <div class="stat-card" onclick="openTransactions()">
-                        <div class="stat-value">{transaction_overview.get('total_transactions', 0):,}</div>
-                        <div class="stat-label">Total Transactions</div>
-                        <div class="stat-change">Last 24 hours</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">{transaction_overview.get('success_rate', 0)}%</div>
-                        <div class="stat-label">Success Rate</div>
-                        <div class="stat-change">{transaction_overview.get('successful_transactions', 0):,} successful</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${transaction_overview.get('daily_volume', 0):,.0f}</div>
-                        <div class="stat-label">Daily Volume</div>
-                        <div class="stat-change">Peak: {transaction_overview.get('peak_hour', 'Unknown')}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${transaction_overview.get('avg_transaction_amount', 0):,.0f}</div>
-                        <div class="stat-label">Avg Transaction</div>
-                        <div class="stat-change">{transaction_overview.get('failed_transactions', 0):,} failed</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Recent Transactions & Metrics -->
-            <div class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="section-title">📋 Recent Transactions</div>
-                        <div class="section-subtitle">Latest payment activities and system metrics</div>
-                    </div>
-                </div>
-                <div class="transaction-grid">
-                    <div class="transaction-table">
-                        <div class="table-header">
-                            Latest Transactions
-                            <a href="/transactions/html" class="view-all-btn" target="_blank">View All</a>
-                        </div>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Transaction ID</th>
-                                    <th>Time</th>
-                                    <th>Amount</th>
-                                    <th>Status</th>
-                                    <th>User</th>
-                                    <th>Method</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {transaction_rows_html}
-                            </tbody>
-                        </table>
-                    </div>
-                    
-                    <div class="metrics-panel">
-                        <h3 style="margin-bottom: 20px; color: #2a5298;">📊 Key Metrics</h3>
-                        <div class="metric-item">
-                            <span class="metric-label">Peak Hour</span>
-                            <span class="metric-value">{transaction_overview.get('peak_hour', 'Unknown')}</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Success Rate</span>
-                            <span class="metric-value">{transaction_overview.get('success_rate', 0)}%</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Failed Today</span>
-                            <span class="metric-value" style="color: #dc3545;">{transaction_overview.get('failed_transactions', 0):,}</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Avg Amount</span>
-                            <span class="metric-value">${transaction_overview.get('avg_transaction_amount', 0):,.2f}</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Data Source</span>
-                            <span class="metric-value">MySQL Shards</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Last Update</span>
-                            <span class="metric-value">{datetime.now().strftime("%H:%M:%S")}</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Shard Details -->
-            <div class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="section-title">🗄️ Database Shard Overview</div>
-                        <div class="section-subtitle">Individual shard performance and health status</div>
-                    </div>
-                </div>
-                <div class="shard-grid">
-                    {shard_cards_html}
-                </div>
-            </div>
-            
-            <div class="refresh-time">
-                📅 Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | 🔄 Auto-refresh: 30 seconds | 
-                💡 Click shard cards for detailed analytics
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html_content
+    # Pass all data to the template
+    return templates.TemplateResponse("dashboard.html", {
+        "request": request,
+        "current_user": current_user,
+        "data": data,
+        "now": datetime.now()
+    })
 
 @app.get("/shard/{shard_id}/html", response_class=HTMLResponse)
-async def get_shard_detail_html(shard_id: str):
-    """Get detailed HTML view for a specific shard"""
+async def get_shard_detail_html(shard_id: str, request: Request, current_user: dict = Depends(require_auth)):
+    """Get detailed HTML view for a specific shard - requires authentication"""
     shard_data = await get_shard_details(shard_id)
     
     if "error" in shard_data:
-        return f"<html><body><h1>Error</h1><p>{shard_data['error']}</p></body></html>"
+        return templates.TemplateResponse("error.html", {
+            "request": request,
+            "error": shard_data["error"]
+        })
     
     details = shard_data["details"]
     performance = shard_data["performance_metrics"]
     
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Shard {shard_id} - Detailed Analytics</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                margin: 0;
-                padding: 20px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: #333;
-                min-height: 100vh;
-            }}
-            .container {{
-                max-width: 1000px;
-                margin: 0 auto;
-                background: white;
-                border-radius: 15px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                overflow: hidden;
-            }}
-            .header {{
-                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-                color: white;
-                padding: 30px;
-                text-align: center;
-                position: relative;
-            }}
-            .back-btn {{
-                position: absolute;
-                top: 20px;
-                left: 20px;
-                background: rgba(255,255,255,0.2);
-                color: white;
-                padding: 10px 20px;
-                border-radius: 6px;
-                text-decoration: none;
-                transition: all 0.3s ease;
-            }}
-            .back-btn:hover {{
-                background: rgba(255,255,255,0.3);
-            }}
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                padding: 30px;
-            }}
-            .stat-card {{
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                text-align: center;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-                border-left: 5px solid #667eea;
-            }}
-            .stat-value {{
-                font-size: 2em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 8px;
-            }}
-            .stat-label {{
-                color: #666;
-                font-size: 0.9em;
-            }}
-            .performance-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                padding: 0 30px 30px 30px;
-            }}
-            .performance-card {{
-                background: #f8f9fa;
-                border-radius: 12px;
-                padding: 20px;
-                border: 2px solid #e9ecef;
-            }}
-            .performance-header {{
-                font-size: 1.2em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 15px;
-            }}
-            .performance-item {{
-                display: flex;
-                justify-content: space-between;
-                margin: 10px 0;
-                padding: 8px 0;
-                border-bottom: 1px solid #dee2e6;
-            }}
-            .status-indicator {{
-                display: inline-block;
-                width: 12px;
-                height: 12px;
-                border-radius: 50%;
-                margin-right: 8px;
-            }}
-            .healthy {{ background: #28a745; }}
-            .warning {{ background: #ffc107; }}
-            .error {{ background: #dc3545; }}
-        </style>
-        <script>
-            setTimeout(function() {{ location.reload(); }}, 60000);
-        </script>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <a href="/dashboard/html" class="back-btn">← Back to Dashboard</a>
-                <h1>🗄️ Shard {shard_id} Analytics</h1>
-                <p>Detailed performance metrics and health status</p>
-            </div>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value">
-                        <span class="status-indicator {'healthy' if details.get('status') == 'healthy' else 'error'}"></span>
-                        {details.get('status', 'unknown').title()}
-                    </div>
-                    <div class="stat-label">Status</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{details.get('accounts', 0):,}</div>
-                    <div class="stat-label">Total Accounts</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${details.get('total_balance', 0):,.2f}</div>
-                    <div class="stat-label">Total Balance</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{details.get('connection', 'unknown').title()}</div>
-                    <div class="stat-label">Connection</div>
-                </div>
-            </div>
-            
-            <div class="performance-grid">
-                <div class="performance-card">
-                    <div class="performance-header">💻 System Resources</div>
-                    <div class="performance-item">
-                        <span>CPU Usage:</span>
-                        <span style="color: {'#dc3545' if performance.get('cpu_usage', 0) > 80 else '#28a745' if performance.get('cpu_usage', 0) < 50 else '#ffc107'};">
-                            {performance.get('cpu_usage', 0)}%
-                        </span>
-                    </div>
-                    <div class="performance-item">
-                        <span>Memory Usage:</span>
-                        <span style="color: {'#dc3545' if performance.get('memory_usage', 0) > 80 else '#28a745' if performance.get('memory_usage', 0) < 50 else '#ffc107'};">
-                            {performance.get('memory_usage', 0)}%
-                        </span>
-                    </div>
-                    <div class="performance-item">
-                        <span>Disk Usage:</span>
-                        <span style="color: {'#dc3545' if performance.get('disk_usage', 0) > 80 else '#28a745' if performance.get('disk_usage', 0) < 50 else '#ffc107'};">
-                            {performance.get('disk_usage', 0)}%
-                        </span>
-                    </div>
-                </div>
-                
-                <div class="performance-card">
-                    <div class="performance-header">⚡ Query Performance</div>
-                    <div class="performance-item">
-                        <span>Queries/Second:</span>
-                        <span style="color: #2a5298; font-weight: bold;">{performance.get('queries_per_second', 0):,}</span>
-                    </div>
-                    <div class="performance-item">
-                        <span>Avg Query Time:</span>
-                        <span style="color: {'#dc3545' if performance.get('avg_query_time', 0) > 10 else '#28a745' if performance.get('avg_query_time', 0) < 5 else '#ffc107'};">
-                            {performance.get('avg_query_time', 0)}ms
-                        </span>
-                    </div>
-                    <div class="performance-item">
-                        <span>Last Backup:</span>
-                        <span>{datetime.fromisoformat(details.get('last_backup', datetime.now().isoformat())).strftime("%Y-%m-%d %H:%M")}</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div style="text-align: center; padding: 20px; color: #666; font-style: italic;">
-                Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | Auto-refresh: 60 seconds
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    # Format last backup time
+    last_backup_time = datetime.fromisoformat(details.get('last_backup', datetime.now().isoformat())).strftime("%Y-%m-%d %H:%M")
     
-    return html_content
+    return templates.TemplateResponse("shard_detail.html", {
+        "request": request,
+        "current_user": current_user,
+        "shard_id": shard_id,
+        "details": details,
+        "performance": performance,
+        "last_backup_time": last_backup_time,
+        "now": datetime.now()
+    })
 
 @app.get("/user-analytics/{user_id}/html", response_class=HTMLResponse)
-async def get_user_analytics_html(user_id: str, days: int = Query(30)):
-    """HTML view for user analytics with balance, transaction history, and debit/credit details"""
+async def get_user_analytics_html(
+    user_id: str, 
+    days: int = Query(30),
+    request: Request = None,
+    current_user: dict = Depends(require_auth)
+):
+    """HTML view for user analytics with balance, transaction history, and debit/credit details - requires authentication"""
     try:
         # Get user analytics data
         user_data_response = await get_user_analytics(user_id, limit=100, days=days)
         
         if "error" in user_data_response:
-            return f"""
-            <html>
-                <head><title>User Analytics - Error</title></head>
-                <body style="font-family: Arial, sans-serif; margin: 20px;">
-                    <h1>User Analytics Error</h1>
-                    <div style="color: red; padding: 10px; border: 1px solid red; border-radius: 5px;">
-                        {user_data_response['error']}
-                    </div>
-                    <a href="/dashboard/html">← Back to Dashboard</a>
-                </body>
-            </html>
-            """
+            return templates.TemplateResponse("error.html", {
+                "request": request,
+                "error": user_data_response['error']
+            })
         
         user_data = user_data_response
         
-        # Generate transaction rows
-        transaction_rows = ""
-        for txn in user_data["transactions"]:
-            direction_color = "#e74c3c" if txn["direction"] == "debit" else "#27ae60"
-            direction_symbol = "-" if txn["direction"] == "debit" else "+"
-            amount_display = f"{direction_symbol}${txn['amount']:.2f}"
-            
-            other_party = txn["to_user_id"] if txn["direction"] == "debit" else txn["from_user_id"]
-            
-            transaction_rows += f"""
-            <tr>
-                <td>{txn['timestamp'][:19] if txn['timestamp'] else 'N/A'}</td>
-                <td>{txn['transaction_id'][:8]}...</td>
-                <td><span style="color: {direction_color}; font-weight: bold;">{txn['direction'].upper()}</span></td>
-                <td>{other_party}</td>
-                <td style="color: {direction_color}; font-weight: bold;">{amount_display}</td>
-                <td><span class="status-{txn['status'].lower()}">{txn['status']}</span></td>
-                <td>Shard {txn['shard_id']}</td>
-            </tr>
-            """
-        
-        # Calculate balance trend
-        balance_trend = "📈" if user_data["monthly_summary"]["net_flow"] > 0 else "📉" if user_data["monthly_summary"]["net_flow"] < 0 else "➡️"
-        
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>User Analytics - {user_id}</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }}
-                .container {{ max-width: 1200px; margin: 0 auto; }}
-                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }}
-                .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }}
-                .card {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                .card h3 {{ margin: 0 0 10px 0; color: #333; }}
-                .balance {{ font-size: 2em; font-weight: bold; color: #27ae60; }}
-                .metric {{ font-size: 1.2em; margin: 5px 0; }}
-                .positive {{ color: #27ae60; }}
-                .negative {{ color: #e74c3c; }}
-                .table-container {{ background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                table {{ width: 100%; border-collapse: collapse; }}
-                th {{ background: #34495e; color: white; padding: 15px; text-align: left; }}
-                td {{ padding: 12px 15px; border-bottom: 1px solid #eee; }}
-                tr:hover {{ background-color: #f8f9fa; }}
-                .status-completed, .status-success {{ background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }}
-                .status-pending {{ background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }}
-                .status-failed {{ background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }}
-                .nav {{ margin-bottom: 20px; }}
-                .nav a {{ color: #667eea; text-decoration: none; margin-right: 20px; }}
-                .nav a:hover {{ text-decoration: underline; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="nav">
-                    <a href="/dashboard/html">← Dashboard</a>
-                    <a href="/transactions/html">All Transactions</a>
-                    <a href="/user-analytics/{user_id}/html?days=7">Last 7 Days</a>
-                    <a href="/user-analytics/{user_id}/html?days=30">Last 30 Days</a>
-                    <a href="/user-analytics/{user_id}/html?days=90">Last 90 Days</a>
-                </div>
-                
-                <div class="header">
-                    <h1>📊 User Analytics: {user_id}</h1>
-                    <p>Account overview and transaction history for the last {days} days</p>
-                </div>
-                
-                <div class="cards">
-                    <div class="card">
-                        <h3>💰 Current Balance</h3>
-                        <div class="balance">${user_data["current_balance"]:.2f}</div>
-                        <div style="color: #666; margin-top: 10px;">
-                            Shard: {user_data["account_details"]["shard_id"] if user_data["account_details"] else "N/A"}
-                            <br>Status: {user_data["account_details"]["status"] if user_data["account_details"] else "N/A"}
-                        </div>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>📤 Total Sent</h3>
-                        <div class="metric negative">${user_data["monthly_summary"]["total_sent"]:.2f}</div>
-                        <div style="color: #666;">Money sent in {days} days</div>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>📥 Total Received</h3>
-                        <div class="metric positive">${user_data["monthly_summary"]["total_received"]:.2f}</div>
-                        <div style="color: #666;">Money received in {days} days</div>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>{balance_trend} Net Flow</h3>
-                        <div class="metric {'positive' if user_data["monthly_summary"]["net_flow"] >= 0 else 'negative'}">
-                            ${user_data["monthly_summary"]["net_flow"]:.2f}
-                        </div>
-                        <div style="color: #666;">Received - Sent</div>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>📊 Transaction Stats</h3>
-                        <div class="metric">{user_data["transaction_count"]} transactions</div>
-                        <div style="color: #666;">
-                            Avg: ${user_data["monthly_summary"]["avg_transaction_amount"]:.2f}
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Date & Time</th>
-                                <th>Transaction ID</th>
-                                <th>Type</th>
-                                <th>Other Party</th>
-                                <th>Amount</th>
-                                <th>Status</th>
-                                <th>Shard</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {transaction_rows if transaction_rows else '<tr><td colspan="7" style="text-align: center; color: #666;">No transactions found</td></tr>'}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html_content
+        # Return template with user data
+        return templates.TemplateResponse("user_analytics.html", {
+            "request": request,
+            "current_user": current_user,
+            "user_id": user_id,
+            "days": days,
+            "user_data": user_data
+        })
         
     except Exception as e:
-        return f"""
-        <html>
-            <head><title>User Analytics - Error</title></head>
-            <body style="font-family: Arial, sans-serif; margin: 20px;">
-                <h1>Error Loading User Analytics</h1>
-                <p style="color: red;">Error: {str(e)}</p>
-                <a href="/dashboard/html">← Back to Dashboard</a>
-            </body>
-        </html>
-        """
+        return templates.TemplateResponse("error.html", {
+            "request": request,
+            "error": f"Error loading user analytics: {str(e)}"
+        })
 
 @app.get("/transactions/html", response_class=HTMLResponse)
 async def get_transactions_html(
+    request: Request,
+    current_user: dict = Depends(require_auth),
     limit: int = Query(50, description="Number of transactions to return"),
     status: Optional[str] = Query(None, description="Filter by status: success, failed"),
     user_id: Optional[str] = Query(None, description="Filter by specific user ID"),
@@ -1807,511 +1071,17 @@ async def get_transactions_html(
         start_date=start_date, 
         end_date=end_date
     )
-    transactions = transaction_data["transactions"]
-    summary = transaction_data["summary"]
-    filters = transaction_data["filters_applied"]
     
-    # Build transaction rows
-    transaction_rows_html = ""
-    for txn in transactions:
-        status_color = "#28a745" if txn["status"] == "success" else "#dc3545"
-        status_icon = "✅" if txn["status"] == "success" else "❌"
-        
-        transaction_rows_html += f"""
-            <tr>
-                <td><span class="txn-id">{txn["transaction_id"]}</span></td>
-                <td>{datetime.fromisoformat(txn["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")}</td>
-                <td><strong>${txn["amount"]:.2f}</strong></td>
-                <td><span style="color: {status_color}; font-weight: bold;">{status_icon} {txn["status"].title()}</span></td>
-                <td><a href="?user_id={txn["user_id"]}" class="user-link">{txn["user_id"]}</a></td>
-                <td><a href="?merchant_id={txn["merchant_id"]}" class="merchant-link">{txn["merchant_id"]}</a></td>
-                <td><span class="payment-method">{txn["payment_method"].title()}</span></td>
-            </tr>"""
-    
-    # Build filter options
-    status_options = ""
-    for status_option in ["", "success", "failed"]:
-        selected = "selected" if status_option == (status or "") else ""
-        status_options += f'<option value="{status_option}" {selected}>{status_option.title() if status_option else "All Statuses"}</option>'
-    
-    # Get today's date for default values
-    today = datetime.now().strftime("%Y-%m-%d")
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Transaction Analytics - PayTM Style Dashboard</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * {{
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }}
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: #333;
-                min-height: 100vh;
-            }}
-            .nav-bar {{
-                background: rgba(255, 255, 255, 0.95);
-                backdrop-filter: blur(10px);
-                padding: 15px 30px;
-                box-shadow: 0 2px 20px rgba(0,0,0,0.1);
-                position: sticky;
-                top: 0;
-                z-index: 100;
-            }}
-            .nav-content {{
-                max-width: 1400px;
-                margin: 0 auto;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-            .nav-title {{
-                font-size: 1.8em;
-                font-weight: bold;
-                color: #2a5298;
-            }}
-            .nav-links {{
-                display: flex;
-                gap: 20px;
-            }}
-            .nav-link {{
-                color: #666;
-                text-decoration: none;
-                padding: 8px 16px;
-                border-radius: 6px;
-                transition: all 0.3s ease;
-            }}
-            .nav-link:hover, .nav-link.active {{
-                background: #667eea;
-                color: white;
-            }}
-            .container {{
-                max-width: 1400px;
-                margin: 20px auto;
-                background: white;
-                border-radius: 15px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                overflow: hidden;
-            }}
-            .header {{
-                background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-                color: white;
-                padding: 30px;
-                position: relative;
-            }}
-            .back-btn {{
-                position: absolute;
-                top: 20px;
-                left: 20px;
-                background: rgba(255,255,255,0.2);
-                color: white;
-                padding: 10px 20px;
-                border-radius: 6px;
-                text-decoration: none;
-                transition: all 0.3s ease;
-            }}
-            .back-btn:hover {{
-                background: rgba(255,255,255,0.3);
-            }}
-            .filters-section {{
-                background: #f8f9fa;
-                padding: 25px 30px;
-                border-bottom: 3px solid #e9ecef;
-            }}
-            .filters-title {{
-                font-size: 1.3em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 20px;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }}
-            .filters-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                margin-bottom: 20px;
-            }}
-            .filter-group {{
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-            }}
-            .filter-group label {{
-                font-weight: 600;
-                color: #495057;
-                font-size: 0.9em;
-            }}
-            .filter-group input, .filter-group select {{
-                padding: 10px 12px;
-                border: 2px solid #ced4da;
-                border-radius: 8px;
-                font-size: 14px;
-                transition: all 0.3s ease;
-            }}
-            .filter-group input:focus, .filter-group select:focus {{
-                border-color: #667eea;
-                outline: none;
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            }}
-            .filter-actions {{
-                display: flex;
-                gap: 15px;
-                justify-content: flex-end;
-                margin-top: 20px;
-            }}
-            .apply-btn, .clear-btn {{
-                padding: 12px 24px;
-                border: none;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: 600;
-                transition: all 0.3s ease;
-                text-decoration: none;
-                display: inline-block;
-                text-align: center;
-            }}
-            .apply-btn {{
-                background: #667eea;
-                color: white;
-            }}
-            .apply-btn:hover {{
-                background: #5a6fd8;
-                transform: translateY(-2px);
-            }}
-            .clear-btn {{
-                background: #6c757d;
-                color: white;
-            }}
-            .clear-btn:hover {{
-                background: #5a6268;
-                transform: translateY(-2px);
-            }}
-            .summary-stats {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                padding: 30px;
-                background: #f8f9fa;
-            }}
-            .summary-card {{
-                background: white;
-                border-radius: 12px;
-                padding: 20px;
-                text-align: center;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-                border-left: 5px solid #667eea;
-                transition: transform 0.3s ease;
-            }}
-            .summary-card:hover {{
-                transform: translateY(-3px);
-            }}
-            .summary-value {{
-                font-size: 1.8em;
-                font-weight: bold;
-                color: #2a5298;
-                margin-bottom: 5px;
-            }}
-            .summary-label {{
-                color: #666;
-                font-size: 0.9em;
-            }}
-            .table-container {{
-                padding: 30px;
-                overflow-x: auto;
-            }}
-            .table-header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-                padding-bottom: 15px;
-                border-bottom: 2px solid #e9ecef;
-            }}
-            .table-title {{
-                font-size: 1.3em;
-                font-weight: bold;
-                color: #2a5298;
-            }}
-            .results-info {{
-                color: #666;
-                font-size: 0.9em;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                background: white;
-                border-radius: 12px;
-                overflow: hidden;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            }}
-            th {{
-                background: #667eea;
-                color: white;
-                padding: 15px 12px;
-                text-align: left;
-                font-weight: 600;
-                font-size: 14px;
-            }}
-            td {{
-                padding: 12px;
-                border-bottom: 1px solid #e9ecef;
-                font-size: 14px;
-            }}
-            tr:hover {{
-                background: #f8f9fa;
-            }}
-            tr:last-child td {{
-                border-bottom: none;
-            }}
-            .txn-id {{
-                font-family: monospace;
-                font-size: 0.9em;
-                background: #e9ecef;
-                padding: 4px 8px;
-                border-radius: 4px;
-            }}
-            .user-link, .merchant-link {{
-                color: #667eea;
-                text-decoration: none;
-                font-weight: 500;
-                padding: 2px 6px;
-                border-radius: 4px;
-                transition: all 0.3s ease;
-            }}
-            .user-link:hover, .merchant-link:hover {{
-                background: #667eea;
-                color: white;
-            }}
-            .payment-method {{
-                background: #28a745;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 12px;
-                font-size: 0.8em;
-                font-weight: 500;
-            }}
-            .no-data {{
-                text-align: center;
-                padding: 60px 20px;
-                color: #666;
-                font-style: italic;
-                font-size: 1.1em;
-            }}
-            .no-data-icon {{
-                font-size: 3em;
-                margin-bottom: 20px;
-                opacity: 0.5;
-            }}
-            .active-filters {{
-                background: #e3f2fd;
-                padding: 15px 20px;
-                margin: 20px 30px;
-                border-radius: 8px;
-                border-left: 4px solid #2196f3;
-            }}
-            .active-filters h4 {{
-                color: #1976d2;
-                margin-bottom: 10px;
-            }}
-            .filter-tag {{
-                display: inline-block;
-                background: #2196f3;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 12px;
-                font-size: 0.8em;
-                margin: 2px;
-            }}
-        </style>
-        <script>
-            function applyFilters() {{
-                const status = document.getElementById('statusFilter').value;
-                const userId = document.getElementById('userIdFilter').value;
-                const merchantId = document.getElementById('merchantIdFilter').value;
-                const startDate = document.getElementById('startDateFilter').value;
-                const endDate = document.getElementById('endDateFilter').value;
-                const limit = document.getElementById('limitFilter').value;
-                
-                let url = '/transactions/html?limit=' + limit;
-                if (status) url += '&status=' + encodeURIComponent(status);
-                if (userId) url += '&user_id=' + encodeURIComponent(userId);
-                if (merchantId) url += '&merchant_id=' + encodeURIComponent(merchantId);
-                if (startDate) url += '&start_date=' + encodeURIComponent(startDate);
-                if (endDate) url += '&end_date=' + encodeURIComponent(endDate);
-                
-                window.location.href = url;
-            }}
-            
-            function clearFilters() {{
-                window.location.href = '/transactions/html';
-            }}
-            
-            function setQuickFilter(days) {{
-                const endDate = new Date();
-                const startDate = new Date();
-                startDate.setDate(startDate.getDate() - days);
-                
-                document.getElementById('startDateFilter').value = startDate.toISOString().split('T')[0];
-                document.getElementById('endDateFilter').value = endDate.toISOString().split('T')[0];
-            }}
-            
-            setTimeout(function() {{ location.reload(); }}, 120000); // Refresh every 2 minutes
-        </script>
-    </head>
-    <body>
-        <nav class="nav-bar">
-            <div class="nav-content">
-                <div class="nav-title">💳 PayTM-Style Analytics</div>
-                <div class="nav-links">
-                    <a href="/dashboard/html" class="nav-link">Dashboard</a>
-                    <a href="#" class="nav-link active">Transactions</a>
-                    <a href="/dashboard" class="nav-link" target="_blank">API</a>
-                </div>
-            </div>
-        </nav>
-
-        <div class="container">
-            <div class="header">
-                <a href="/dashboard/html" class="back-btn">← Back to Dashboard</a>
-                <h1 style="text-align: center; margin: 0;">💳 Advanced Transaction Analytics</h1>
-                <p style="text-align: center; margin: 10px 0 0 0; opacity: 0.9;">
-                    Filter and analyze payment transactions by date, user, status, and more
-                </p>
-            </div>
-            
-            <div class="filters-section">
-                <div class="filters-title">
-                    🔍 Advanced Filters
-                    <div style="margin-left: auto; font-size: 0.8em; font-weight: normal;">
-                        Quick: 
-                        <button onclick="setQuickFilter(1)" style="margin-left: 5px; padding: 4px 8px; border: none; background: #667eea; color: white; border-radius: 4px; cursor: pointer;">Today</button>
-                        <button onclick="setQuickFilter(7)" style="margin-left: 5px; padding: 4px 8px; border: none; background: #667eea; color: white; border-radius: 4px; cursor: pointer;">7 Days</button>
-                        <button onclick="setQuickFilter(30)" style="margin-left: 5px; padding: 4px 8px; border: none; background: #667eea; color: white; border-radius: 4px; cursor: pointer;">30 Days</button>
-                    </div>
-                </div>
-                
-                <div class="filters-grid">
-                    <div class="filter-group">
-                        <label for="statusFilter">Transaction Status</label>
-                        <select id="statusFilter">
-                            {status_options}
-                        </select>
-                    </div>
-                    <div class="filter-group">
-                        <label for="userIdFilter">User ID</label>
-                        <input type="text" id="userIdFilter" placeholder="e.g., user_1234" value="{user_id or ''}">
-                    </div>
-                    <div class="filter-group">
-                        <label for="merchantIdFilter">Merchant ID</label>
-                        <input type="text" id="merchantIdFilter" placeholder="e.g., merchant_567" value="{merchant_id or ''}">
-                    </div>
-                    <div class="filter-group">
-                        <label for="startDateFilter">Start Date</label>
-                        <input type="date" id="startDateFilter" value="{start_date or ''}">
-                    </div>
-                    <div class="filter-group">
-                        <label for="endDateFilter">End Date</label>
-                        <input type="date" id="endDateFilter" value="{end_date or ''}">
-                    </div>
-                    <div class="filter-group">
-                        <label for="limitFilter">Results Limit</label>
-                        <select id="limitFilter">
-                            <option value="25" {'selected' if filters.get('limit') == 25 else ''}>25 Results</option>
-                            <option value="50" {'selected' if filters.get('limit') == 50 else ''}>50 Results</option>
-                            <option value="100" {'selected' if filters.get('limit') == 100 else ''}>100 Results</option>
-                            <option value="200" {'selected' if filters.get('limit') == 200 else ''}>200 Results</option>
-                            <option value="500" {'selected' if filters.get('limit') == 500 else ''}>500 Results</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <div class="filter-actions">
-                    <button class="clear-btn" onclick="clearFilters()">Clear All Filters</button>
-                    <button class="apply-btn" onclick="applyFilters()">Apply Filters</button>
-                </div>
-            </div>
-            
-            {f'''
-            <div class="active-filters">
-                <h4>🎯 Active Filters:</h4>
-                {f'<span class="filter-tag">Status: {status}</span>' if status else ''}
-                {f'<span class="filter-tag">User: {user_id}</span>' if user_id else ''}
-                {f'<span class="filter-tag">Merchant: {merchant_id}</span>' if merchant_id else ''}
-                {f'<span class="filter-tag">From: {start_date}</span>' if start_date else ''}
-                {f'<span class="filter-tag">To: {end_date}</span>' if end_date else ''}
-                <span class="filter-tag">Limit: {limit}</span>
-            </div>
-            ''' if any([status, user_id, merchant_id, start_date, end_date]) else ''}
-            
-            <div class="summary-stats">
-                <div class="summary-card">
-                    <div class="summary-value">{summary.get('total_transactions', 0):,}</div>
-                    <div class="summary-label">Total in System</div>
-                </div>
-                <div class="summary-card">
-                    <div class="summary-value">{summary.get('filtered_count', 0):,}</div>
-                    <div class="summary-label">Filtered Results</div>
-                </div>
-                <div class="summary-card">
-                    <div class="summary-value">{summary.get('success_rate', 0)}%</div>
-                    <div class="summary-label">Success Rate</div>
-                </div>
-                <div class="summary-card">
-                    <div class="summary-value">${summary.get('daily_volume', 0):,.0f}</div>
-                    <div class="summary-label">Daily Volume</div>
-                </div>
-            </div>
-            
-            <div class="table-container">
-                <div class="table-header">
-                    <div class="table-title">📋 Transaction Results</div>
-                    <div class="results-info">
-                        Showing {len(transactions)} of {transaction_data['total_count']} filtered transactions
-                        ({transaction_data.get('total_available', 0)} total available)
-                    </div>
-                </div>
-                
-                {'<div class="no-data"><div class="no-data-icon">📭</div>No transactions found matching your criteria.<br>Try adjusting your filters or expanding the date range.</div>' if not transactions else f'''
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Transaction ID</th>
-                            <th>Date & Time</th>
-                            <th>Amount</th>
-                            <th>Status</th>
-                            <th>User ID</th>
-                            <th>Merchant ID</th>
-                            <th>Payment Method</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {transaction_rows_html}
-                    </tbody>
-                </table>
-                '''}
-            </div>
-            
-            <div style="text-align: center; padding: 20px; color: #666; font-style: italic;">
-                📅 Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | 🔄 Auto-refresh: 2 minutes |
-                💡 Click user/merchant IDs to filter by them
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html_content
+    return templates.TemplateResponse("transactions.html", {
+        "request": request,
+        "current_user": current_user,
+        "transactions": transaction_data["transactions"],
+        "summary": transaction_data["summary"],
+        "filters": transaction_data["filters_applied"],
+        "total_count": transaction_data["total_count"],
+        "total_available": transaction_data.get("total_available", 0),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 
 # Enhanced Analytics Endpoints with Recent Transaction Limits and Shard-wise Data
@@ -2332,8 +1102,6 @@ async def get_recent_transactions(
                 
             try:
                 cursor = connection.cursor(dictionary=True)
-                
-                # Get recent transactions from this shard
                 query = """
                 SELECT 
                     transaction_id,
@@ -2353,9 +1121,7 @@ async def get_recent_transactions(
                 transactions = cursor.fetchall()
                 
                 for txn in transactions:
-                    txn['amount'] = float(txn['amount']) / 100  # Convert from cents
-                    txn['shard_id'] = shard_id
-                    all_transactions.append(txn)
+                    all_transactions.append(dict(txn))
                 
                 cursor.close()
                 
@@ -2639,6 +1405,286 @@ async def get_enhanced_dashboard(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate enhanced dashboard: {e}")
+
+
+@app.get("/fraud-dashboard", response_class=HTMLResponse)
+async def get_fraud_dashboard(request: Request, current_user: dict = Depends(require_auth)):
+    """Fraud Management Dashboard integrated into Analytics Service"""
+    return templates.TemplateResponse("fraud_dashboard.html", {
+        "request": request,
+        "current_user": current_user
+    })
+
+
+# User Portal Endpoints
+@app.get("/user/login", response_class=HTMLResponse)
+async def user_login_page(request: Request, error: str = Query(None), success: str = Query(None)):
+    """User login page"""
+    return templates.TemplateResponse("user_login.html", {
+        "request": request,
+        "error": error,
+        "success": success
+    })
+
+@app.post("/user/login")
+async def user_login(request: Request, user_id: str = Form(...)):
+    """Handle user login - check if user exists in any shard"""
+    try:
+        connections = get_all_shard_connections()
+        user_found = False
+        
+        for shard_id, connection in connections.items():
+            if connection is None:
+                continue
+            
+            try:
+                cursor = connection.cursor(dictionary=True)
+                cursor.execute("SELECT user_id FROM accounts WHERE user_id = %s", (user_id,))
+                result = cursor.fetchone()
+                cursor.close()
+                
+                if result:
+                    user_found = True
+                    break
+                    
+            except Error as e:
+                print(f"Error checking user in shard {shard_id}: {e}")
+            finally:
+                if connection and connection.is_connected():
+                    connection.close()
+        
+        if not user_found:
+            return RedirectResponse(
+                url=f"/user/login?error=User ID '{user_id}' not found. Please check the user ID.",
+                status_code=302
+            )
+        
+        # Create user session (simple cookie-based)
+        response = RedirectResponse(url="/user/wallet", status_code=302)
+        response.set_cookie(
+            key="user_session",
+            value=user_id,
+            max_age=8 * 60 * 60,  # 8 hours
+            httponly=True,
+            secure=False,
+            samesite="lax"
+        )
+        return response
+        
+    except Exception as e:
+        return RedirectResponse(
+            url=f"/user/login?error=Login failed: {str(e)}",
+            status_code=302
+        )
+
+@app.get("/user/logout")
+async def user_logout():
+    """Handle user logout"""
+    response = RedirectResponse(url="/user/login?success=Logged out successfully", status_code=302)
+    response.delete_cookie(key="user_session")
+    return response
+
+async def get_user_session(request: Request) -> Optional[str]:
+    """Get current logged in user from session"""
+    return request.cookies.get("user_session")
+
+async def require_user_auth(request: Request) -> str:
+    """Require user authentication"""
+    user_id = await get_user_session(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Please login first")
+    return user_id
+
+@app.get("/user/wallet", response_class=HTMLResponse)
+async def user_wallet_page(
+    request: Request,
+    days: int = Query(30),
+    error: str = Query(None),
+    success: str = Query(None)
+):
+    """User wallet page - main user dashboard"""
+    try:
+        user_id = await require_user_auth(request)
+        
+        # Get user analytics data
+        user_data = await get_user_analytics(user_id, limit=100, days=days)
+        
+        if "error" in user_data:
+            return templates.TemplateResponse("error.html", {
+                "request": request,
+                "error": user_data['error']
+            })
+        
+        return templates.TemplateResponse("user_wallet.html", {
+            "request": request,
+            "user_id": user_id,
+            "days": days,
+            "user_data": user_data,
+            "error": error,
+            "success": success
+        })
+        
+    except HTTPException:
+        return RedirectResponse(url="/user/login?error=Please login first", status_code=302)
+    except Exception as e:
+        return templates.TemplateResponse("error.html", {
+            "request": request,
+            "error": f"Error loading wallet: {str(e)}"
+        })
+
+@app.post("/user/send-money")
+async def user_send_money(
+    request: Request,
+    from_user: str = Form(...),
+    to_user: str = Form(...),
+    amount: float = Form(...)
+):
+    """Send money from one user to another"""
+    try:
+        # Verify user session
+        session_user = await require_user_auth(request)
+        if session_user != from_user:
+            return RedirectResponse(
+                url="/user/wallet?error=Unauthorized transaction attempt",
+                status_code=302
+            )
+        
+        # Validate amount
+        if amount <= 0:
+            return RedirectResponse(
+                url="/user/wallet?error=Amount must be greater than 0",
+                status_code=302
+            )
+        
+        # Check sender balance
+        user_data = await get_user_analytics(from_user, limit=1, days=1)
+        if "error" in user_data:
+            return RedirectResponse(
+                url=f"/user/wallet?error=Sender not found: {user_data['error']}",
+                status_code=302
+            )
+        
+        if user_data["current_balance"] < amount:
+            return RedirectResponse(
+                url=f"/user/wallet?error=Insufficient balance. You have ${user_data['current_balance']:.2f}",
+                status_code=302
+            )
+        
+        # Check recipient exists
+        recipient_data = await get_user_analytics(to_user, limit=1, days=1)
+        if "error" in recipient_data:
+            return RedirectResponse(
+                url=f"/user/wallet?error=Recipient user '{to_user}' not found",
+                status_code=302
+            )
+        
+        # Call shard manager to process transaction (no auth needed for internal calls)
+        try:
+            # Use direct database transaction instead of calling external service
+            # This is simpler for the user wallet demo
+            import mysql.connector
+            import hashlib
+            import uuid
+            from datetime import datetime
+            
+            # Calculate shards for both users
+            from_shard = int(hashlib.md5(from_user.encode()).hexdigest(), 16) % 4
+            to_shard = int(hashlib.md5(to_user.encode()).hexdigest(), 16) % 4
+            amount_cents = int(amount * 100)
+            payment_id = str(uuid.uuid4())
+            
+            # Get shard connections
+            from_conn = get_shard_connection(str(from_shard))
+            to_conn = get_shard_connection(str(to_shard)) if to_shard != from_shard else from_conn
+            
+            if not from_conn:
+                return RedirectResponse(
+                    url=f"/user/wallet?error=Could not connect to database",
+                    status_code=302
+                )
+            
+            try:
+                from_cursor = from_conn.cursor(dictionary=True)
+                to_cursor = to_conn.cursor(dictionary=True) if to_conn != from_conn else from_cursor
+                
+                # Debit sender
+                from_cursor.execute(
+                    "UPDATE accounts SET balance = balance - %s WHERE user_id = %s",
+                    (amount_cents, from_user)
+                )
+                from_cursor.execute(
+                    "INSERT INTO ledger_entries (payment_id, account_id, amount, direction, created_at) VALUES (%s, %s, %s, 'debit', NOW())",
+                    (payment_id, from_user, amount_cents)
+                )
+                
+                # Credit recipient
+                to_cursor.execute(
+                    "UPDATE accounts SET balance = balance + %s WHERE user_id = %s",
+                    (amount_cents, to_user)
+                )
+                to_cursor.execute(
+                    "INSERT INTO ledger_entries (payment_id, account_id, amount, direction, created_at) VALUES (%s, %s, %s, 'credit', NOW())",
+                    (payment_id, to_user, amount_cents)
+                )
+                
+                # Commit both transactions
+                from_conn.commit()
+                if to_conn != from_conn:
+                    to_conn.commit()
+                
+                from_cursor.close()
+                if to_conn != from_conn:
+                    to_cursor.close()
+                from_conn.close()
+                if to_conn != from_conn:
+                    to_conn.close()
+                
+                return RedirectResponse(
+                    url=f"/user/wallet?success=Successfully sent ${amount:.2f} to {to_user}! Transaction ID: {payment_id[:16]}...",
+                    status_code=302
+                )
+                
+            except Exception as db_error:
+                from_conn.rollback()
+                if to_conn != from_conn:
+                    to_conn.rollback()
+                return RedirectResponse(
+                    url=f"/user/wallet?error=Transaction failed: {str(db_error)}",
+                    status_code=302
+                )
+                
+        except Exception as e:
+            return RedirectResponse(
+                url=f"/user/wallet?error=Transaction error: {str(e)}",
+                status_code=302
+            )
+            
+            if payment_response.status_code == 200:
+                result = payment_response.json()
+                return RedirectResponse(
+                    url=f"/user/wallet?success=Successfully sent ${amount:.2f} to {to_user}! Transaction ID: {result.get('payment_id', 'N/A')[:16]}...",
+                    status_code=302
+                )
+            else:
+                error_msg = payment_response.json().get('detail', 'Transaction failed')
+                return RedirectResponse(
+                    url=f"/user/wallet?error=Transaction failed: {error_msg}",
+                    status_code=302
+                )
+                
+        except requests.exceptions.RequestException as e:
+            return RedirectResponse(
+                url=f"/user/wallet?error=Payment service unavailable: {str(e)}",
+                status_code=302
+            )
+        
+    except HTTPException:
+        return RedirectResponse(url="/user/login?error=Please login first", status_code=302)
+    except Exception as e:
+        return RedirectResponse(
+            url=f"/user/wallet?error=Transaction error: {str(e)}",
+            status_code=302
+        )
 
 
 if __name__ == "__main__":

@@ -11,8 +11,8 @@ import time
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-import schedule
 from pathlib import Path
+import schedule
 
 logger = logging.getLogger(__name__)
 
